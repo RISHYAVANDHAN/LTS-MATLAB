@@ -1,140 +1,85 @@
-function result = run_laptime_sim(xy)
-%RUN_LAPTIME_SIM  End-to-end lap-time simulation driver.
+function result = run_laptime_sim(xy, p, options)
+%RUN_LAPTIME_SIM  Master entry point for the GGV lap‑time simulator.
 %
-%   result = RUN_LAPTIME_SIM(xy)
+%   result = RUN_LAPTIME_SIM()                   default params & circular track
+%   result = RUN_LAPTIME_SIM(xy)                 use your track (Nx2)
+%   result = RUN_LAPTIME_SIM(xy, p)              use your parameter struct
+%   result = RUN_LAPTIME_SIM(xy, p, options)     set plot/verbose
 %
-%   Inputs
-%   ------
-%   xy : Nx2 array of track centerline points [m]
-%
-%   Output
-%   ------
-%   result : struct containing all intermediate and final outputs
-%
-%   Workflow
-%   --------
-%   1) Load vehicle/tire parameters
-%   2) Build track geometry
-%   3) Build GGV envelope
-%   4) Compute curvature-based speed limits
-%   5) Run forward pass
-%   6) Run backward pass
-%   7) Merge the passes
-%   8) Compute lap time
-%   9) Plot results
+%   OUTPUT: result struct with all intermediate data.
 
-%% ------------------------------------------------------------------------
-%  1) Parameters
-%  ------------------------------------------------------------------------
+    % ---- Set paths ----
+    rootDir = fileparts(mfilename('fullpath'));
+    addpath(fullfile(rootDir, 'config'));
+    addpath(fullfile(rootDir, 'src', 'tyres'));
+    addpath(fullfile(rootDir, 'src', 'vehicle'));
+    addpath(fullfile(rootDir, 'src', 'optimisers'));
+    addpath(fullfile(rootDir, 'src', 'ggv'));
+    addpath(fullfile(rootDir, 'src', 'track'));
+    addpath(fullfile(rootDir, 'src', 'lap_time'));
 
-p = init_params();
+    % ---- Defaults ----
+    if nargin < 1 || isempty(xy)
+        R = 30;
+        theta = linspace(0, 2*pi, 300)';
+        xy = [R*cos(theta), R*sin(theta)];
+    end
+    if nargin < 2 || isempty(p)
+        p = init_params();
+        p = derive_params(p);
+        validate_params(p);
+    end
+    if nargin < 3
+        options = struct();
+    end
+    if ~isfield(options, 'plot'), options.plot = true; end
+    if ~isfield(options, 'verbose'), options.verbose = true; end
 
-%% ------------------------------------------------------------------------
-%  2) Track
-%  ------------------------------------------------------------------------
+    % ---- Track ----
+    if options.verbose, fprintf('Building track...\n'); end
+    track = track_loader(xy, 'SmoothFactor', 10, 'CloseTrack', true);
 
-if nargin < 1 || isempty(xy)
-    % Default fallback: simple circle for smoke testing only.
-    % Replace this with imported GPS / centerline data for real runs.
-    R = 30;
-    theta = linspace(0, 2*pi, 300)';
-    xy = [R*cos(theta), R*sin(theta)];
-end
+    % ---- GGV ----
+    if options.verbose, fprintf('Building GGV surface...\n'); end
+    ggv = ggv_build(p);
 
-track = track_loader(xy, 'SmoothFactor', 10, 'CloseTrack', true);
+    % ---- Pass 1 ----
+    if options.verbose, fprintf('Pass 1: cornering speed limits...\n'); end
+    v_lim = compute_speed_limits(track, ggv, p);
 
-if track.N < 5
-    error('run_laptime_sim:BadTrack', 'Track is too short or invalid.');
-end
+    % ---- Pass 2 ----
+    if options.verbose, fprintf('Pass 2: forward acceleration...\n'); end
+    fwd = lap_forward_pass(track, v_lim, ggv, p);
 
-%% ------------------------------------------------------------------------
-%  3) GGV envelope
-%  ------------------------------------------------------------------------
+    % ---- Pass 3 ----
+    if options.verbose, fprintf('Pass 3: backward braking...\n'); end
+    bwd = lap_backward_pass(track, v_lim, ggv, p);
 
-v_grid = linspace(0, 40, 250);
-ggv = ggv_envelope(p, v_grid);
+    % ---- Merge ----
+    if options.verbose, fprintf('Merging passes...\n'); end
+    sol = lap_merge(track, fwd, bwd);
 
-%% ------------------------------------------------------------------------
-%  4) Curvature-based speed limits
-%  ------------------------------------------------------------------------
+    % ---- Lap time ----
+    Tlap = compute_lap_time(track, sol);
 
-v_lim = compute_speed_limits(track, ggv);
+    % ---- Output ----
+    result = struct('p', p, 'track', track, 'ggv', ggv, 'v_lim', v_lim, ...
+                    'fwd', fwd, 'bwd', bwd, 'sol', sol, 'Tlap', Tlap, 'options', options);
+    fprintf('Lap time = %.3f s\n', Tlap);
 
-%% ------------------------------------------------------------------------
-%  5) Forward pass
-%  ------------------------------------------------------------------------
-
-fwd = lap_forward_pass(track, v_lim, ggv, p);
-
-%% ------------------------------------------------------------------------
-%  6) Backward pass
-%  ------------------------------------------------------------------------
-
-bwd = lap_backward_pass(track, v_lim, ggv, p);
-
-%% ------------------------------------------------------------------------
-%  7) Merge
-%  ------------------------------------------------------------------------
-
-sol = lap_merge(track, fwd, bwd);
-
-%% ------------------------------------------------------------------------
-%  8) Lap time
-%  ------------------------------------------------------------------------
-
-Tlap = compute_lap_time(track, sol);
-
-%% ------------------------------------------------------------------------
-%  9) Display
-%  ------------------------------------------------------------------------
-
-fprintf('Lap-time simulation complete.\n');
-fprintf('Estimated lap time = %.3f s\n', Tlap);
-
-%% ------------------------------------------------------------------------
-%  10) Plots
-%  ------------------------------------------------------------------------
-
-figure('Name','Lap-time simulation','Color','w');
-
-subplot(3,1,1)
-plot(track.s, sol.v, 'LineWidth', 1.5); hold on;
-plot(track.s, v_lim, '--', 'LineWidth', 1.2);
-xlabel('s [m]');
-ylabel('Speed [m/s]');
-grid on;
-legend('Final speed','Curvature limit','Location','best');
-
-a = subplot(3,1,2);
-plot(track.s, track.kappa, 'LineWidth', 1.5);
-xlabel('s [m]');
-ylabel('Curvature [1/m]');
-grid on;
-
-subplot(3,1,3)
-plot(track.x, track.y, 'LineWidth', 1.5); hold on;
-plot(track.x_left, track.y_left, ':');
-plot(track.x_right, track.y_right, ':');
-xlabel('X [m]');
-ylabel('Y [m]');
-title('Track and boundaries');
-grid on;
-axis equal;
-legend('Centerline','Left boundary','Right boundary','Location','best');
-
-%% ------------------------------------------------------------------------
-%  11) Output
-%  ------------------------------------------------------------------------
-
-if nargout > 0
-    result.p = p;
-    result.track = track;
-    result.ggv = ggv;
-    result.v_lim = v_lim;
-    result.fwd = fwd;
-    result.bwd = bwd;
-    result.sol = sol;
-    result.Tlap = Tlap;
-end
-
+    % ---- Plot ----
+    if options.plot
+        figure('Name', 'Lap-time simulation', 'Color', 'w');
+        subplot(3,1,1);
+        plot(track.s, sol.v, 'LineWidth', 1.5); hold on;
+        plot(track.s, v_lim, '--', 'LineWidth', 1.2);
+        xlabel('s [m]'); ylabel('Speed [m/s]'); grid on;
+        legend('Final', 'Curvature limit', 'Location', 'best');
+        subplot(3,1,2);
+        plot(track.s, track.kappa, 'LineWidth', 1.5);
+        xlabel('s [m]'); ylabel('Curvature [1/m]'); grid on;
+        subplot(3,1,3);
+        plot(track.x, track.y, 'LineWidth', 1.5); axis equal; grid on;
+        xlabel('X [m]'); ylabel('Y [m]'); title('Track');
+    end
 end

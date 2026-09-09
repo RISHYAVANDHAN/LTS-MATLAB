@@ -1,555 +1,788 @@
-# LTS-MATLAB
-Lap-time sim using MATLAB
-## Theory, Mathematics, and Current Implementation
+# GGV Lap Simulation
 
-A quasi‑steady‑state (QSS) lap‑time simulator following the recipe of Mike Law's
-LinkedIn post on vehicle dynamics. This document specifies the full mathematics of
-what is currently implemented, file by file, and ends with the known gaps
-relative to a fully connected vehicle/tyre‑derived solver.
+**COMPLETE FORMULATION — TIRE · VEHICLE · OPTIMISER · CIRCUIT · LAP TIME**
 
----
+## Tire Models
 
-## 1. Pipeline overview
+**STEP 1 — SLIP STATE + VERTICAL LOAD → Fx, Fy, Mz**
 
-The simulator computes a feasible speed profile $v(s)$ along a track arc length
-parameter $s$, then integrates $\mathrm{d}t = \mathrm{d}s/v$ to get a lap time.
-The actual pipeline driven by `run_laptime_sim.m` is:
+The tire is the only element that generates forces at the road contact patch. All three models below take the same inputs and return forces in the tire/wheel frame. The vehicle model then rotates these into the body frame.
 
-```
-init_params  ──►  track_loader  ──►  ggv_envelope  ──►  compute_speed_limits
-                                                              │
-                          ┌─────────────────────────┐         │
-                          │                         │         ▼
-                          │              lap_forward_pass  v_lim(s)
-                          │                         │
-                          │              lap_backward_pass
-                          │                         │
-                          ▼                         ▼
-                          └────────►  lap_merge  ◄──┘
-                                          │
-                                          ▼
-                                  compute_lap_time   ──►  T_lap
-```
-
-Two side scripts, `simulate_straight.m` and `simulate_corner.m`, drive the
-time‑domain bicycle model `bicycle_rhs.m` (with `tire_forces.m`) directly via
-`ode45`. They exist as **unit tests for the vehicle model** and do **not**
-contribute to the lap‑time chain in the current build.
-
-The seven blocks below correspond to the seven sections of code, plus the two
-side tests.
-
----
-
-## 2. Parameter set (`init_params.m`)
-
-A single struct `p` holds everything. The relevant groups:
-
-**Mass and inertia.** $m = 300\ \mathrm{kg}$, $I_z = 120\ \mathrm{kg\,m^2}$.
-
-**Geometry.** Front and rear semi‑wheelbases $a = 0.80\ \mathrm{m}$,
-$b = 0.70\ \mathrm{m}$, so the wheelbase is $L = a+b = 1.50\ \mathrm{m}$.
-CG height $h = 0.25\ \mathrm{m}$. Gravity $g = 9.81\ \mathrm{m/s^2}$.
-
-**Wheel.** Effective rolling radius $R_w = 0.228\ \mathrm{m}$ and per‑wheel
-spin inertia $J_w = 1.20\ \mathrm{kg\,m^2}$.
-
-**Aero (currently zeroed).** Drag area $C_d A = 0$, downforce area $C_l A = 0$,
-$\rho = 1.225\ \mathrm{kg/m^3}$.
-
-**Tyre.** Linear stiffnesses $C_{\alpha f}=C_{\alpha r}=60\,000\ \mathrm{N/rad}$
-(lateral), $C_{xf}=C_{xr}=8\,000\ \mathrm{N}$ (longitudinal). Peak friction
-$\mu_{xf}=\mu_{yf}=\mu_{xr}=\mu_{yr}=1.80$. Saturation shape parameters
-$B_x=10,\ B_y=8,\ S_x=1,\ S_y=1$. Velocity guard $\varepsilon_v = 10^{-3}$.
-
-**Actuator limits.** $\delta_{\max}=18^\circ$, $\dot\delta_{\max}=300^\circ/\mathrm{s}$,
-drive torque $T_{\text{drive,max}}=350\ \mathrm{N\,m}$, brake torque
-$T_{\text{brake,max}}=500\ \mathrm{N\,m}$.
-
-**Static axle loads.** With weight transfer disabled,
-
-$$
-F_{zf,0} = \frac{m g\, b}{L},\qquad
-F_{zr,0} = \frac{m g\, a}{L}.
-$$
-
-For the default parameters $F_{zf,0}\approx 1373\ \mathrm{N}$ and
-$F_{zr,0}\approx 1570\ \mathrm{N}$.
-
-**Track / numerical.** Spatial step $\Delta s = 0.25\ \mathrm{m}$, default
-half‑width $1.5\ \mathrm{m}$, default time step $\mathrm{d}t = 0.01\ \mathrm{s}$.
-
----
-
-## 3. Track geometry (`track_loader.m`)
-
-The input is an $N\times 2$ array of $(x,y)$ centreline points. The function
-delivers an arc‑length parameterised, smooth, optionally closed track with
-heading and curvature.
-
-**(a) Raw arc length.** Define cumulative segment lengths
-
-$$
-\Delta s_k = \sqrt{(x_{k+1}-x_k)^2 + (y_{k+1}-y_k)^2},\qquad
-s_k = \sum_{i=1}^{k-1}\Delta s_i,\qquad L=s_{N}.
-$$
-
-**(b) Spline reparameterisation.** A new uniform arc‑length grid
-$s\in[0,L]$ with $N_s = \mathtt{SmoothFactor}\cdot(N-1)$ samples is created
-and the path is interpolated with shape‑preserving cubic Hermite (PCHIP):
-
-$$
-x_s(s) = \mathrm{PCHIP}(s_{\text{raw}},\,x;\,s),\quad
-y_s(s) = \mathrm{PCHIP}(s_{\text{raw}},\,y;\,s).
-$$
-
-**(c) Heading and curvature.** Using MATLAB's centred-difference `gradient`, the derivatives of the smoothed coordinates with respect to arc length are first computed. The heading angle and curvature are then given by
-
-$$
-\psi(s) =
-\mathrm{atan2}\!\left(
-\frac{dy_s}{ds},
-\frac{dx_s}{ds}
-\right),
-\qquad
-\kappa(s) =
-\frac{d\psi}{ds}.
-$$
-
-Because the path is parameterised by arc length, $|\mathrm{d}\boldsymbol r/\mathrm{d}s|\equiv 1$,
-so the standard curvature formula reduces to this single derivative.
-
-**(d) Segment midpoints.** Useful for solver checks:
-
-$$
-s_{\text{mid},k} = \tfrac12(s_k+s_{k+1}),\qquad
-\kappa_{\text{mid},k} = \tfrac12(\kappa_k+\kappa_{k+1}).
-$$
-
-**(e) Boundaries.** The unit normal to the path (in the direction of "left") is
-$\mathbf{n} = (-\sin\psi,\,\cos\psi)$. With a constant half‑width
-$w_{1/2}=1.5\ \mathrm{m}$ (a placeholder, **not** taken from `p.trackWidth`):
-
-$$
-\mathbf r_{\text{left}}  = \mathbf r + w_{1/2}\,\mathbf n,\qquad
-\mathbf r_{\text{right}} = \mathbf r - w_{1/2}\,\mathbf n.
-$$
-
-If the input does not close, the loader appends the first point so that
-$\mathbf r_0=\mathbf r_N$.
-
----
-
-## 4. Tyre model (`tire_forces.m`)
-
-A practical nonlinear saturating model. **Inputs** per axle:
-normal load $F_z$, slip angle $\alpha$, longitudinal slip ratio $\kappa$,
-parameter struct $p$, axle tag.
-
-**(a) Linear seed.** For the requested axle (with axle‑specific stiffnesses
-$C_x,\,C_y$ and peak frictions $\mu_x,\,\mu_y$):
-
-$$
-F_{x,\text{lin}} = C_x\,\kappa,\qquad
-F_{y,\text{lin}} = -C_y\,\alpha.
-$$
-
-The sign convention is the standard one: positive slip angle produces a
-negative side force (the tyre opposes the lateral drift).
-
-**(b) Smooth saturation.** Each axis is squashed onto the friction cap with
-$\tanh$:
-
-$$
-F_{x,\text{pure}} = \mu_x F_z\;\tanh\!\left(\frac{S_x\,F_{x,\text{lin}}}{\mu_x F_z + \varepsilon}\right),
-\qquad
-F_{y,\text{pure}} = \mu_y F_z\;\tanh\!\left(\frac{S_y\,F_{y,\text{lin}}}{\mu_y F_z + \varepsilon}\right),
-$$
-
-where $\varepsilon = 10^{-9}$ guards against $F_z\to 0$.
-At low slip this reproduces the linear law; at large slip it saturates at
-$\pm\mu F_z$. Sharpness is tunable via $S_x,\,S_y$.
-
-**(c) Friction‑ellipse combined slip.** Normalised demands
-
-$$
-\hat F_x = \frac{F_{x,\text{pure}}}{\mu_x F_z},\qquad
-\hat F_y = \frac{F_{y,\text{pure}}}{\mu_y F_z},\qquad
-\lambda = \sqrt{\hat F_x^2 + \hat F_y^2}.
-$$
-
-If $\lambda \leq 1$ the demand is inside the ellipse and forces are accepted as
-is; otherwise both are scaled down to land on the ellipse:
-
-$$
-(F_x,F_y) =
-\begin{cases}
-(F_{x,\text{pure}},\,F_{y,\text{pure}}) & \lambda \leq 1\\[2pt]
-\dfrac{1}{\lambda}(F_{x,\text{pure}},\,F_{y,\text{pure}}) & \lambda > 1
-\end{cases}
-$$
-
-**(d) Final clamp.** As a safety net the output is hard‑capped to $\pm\mu F_z$
-on each axis.
-
-This is **not** a Magic‑Formula tyre, but it has the three essential traits:
-linear seed, smooth saturation, and combined‑slip coupling.
-
----
-
-## 5. Bicycle vehicle model (`bicycle_rhs.m`)
-
-An 8‑state time‑domain model for the time‑domain unit tests and (in future) for
-the trim optimiser. **Currently not called by the lap pipeline.**
-
-### 5.1 State and inputs
-
-$$
-\mathbf x = \begin{bmatrix} u\\ v\\ r\\ \omega_f\\ \omega_r\\ X\\ Y\\ \psi\end{bmatrix},
-\qquad
-\mathbf u_{\text{in}} = \begin{bmatrix} \delta\\ T_f\\ T_r\end{bmatrix}.
-$$
-
-Symbols: $u$ longitudinal body velocity, $v$ lateral body velocity, $r$ yaw
-rate, $\omega_f,\omega_r$ front/rear wheel spin rates, $(X,Y,\psi)$ global pose,
-$\delta$ front steer angle, $T_f,T_r$ front/rear wheel torques.
-
-### 5.2 Axle velocities
-
-Treating the CG as a single rigid body in plane motion,
-
-$$
-u_f = u,\;\; v_f = v + a r,\qquad u_r = u,\;\; v_r = v - b r.
-$$
-
-### 5.3 Slip angles
-
-The front slip is measured relative to the *steered* wheel; the rear relative
-to the body:
-
-$$
-\alpha_f = \operatorname{atan2}\!\left(v_f,\;\max(|u_f|,\varepsilon_v)\right) - \delta,\qquad
-\alpha_r = \operatorname{atan2}\!\left(v_r,\;\max(|u_r|,\varepsilon_v)\right).
-$$
-
-### 5.4 Longitudinal slip ratios
-
-With wheel spin speed $\omega_\cdot$ and effective radius $R_w$,
-
-$$
-\kappa_f = \frac{R_w \omega_f - u_f}{\max(|u_f|,\varepsilon_v)},\qquad
-\kappa_r = \frac{R_w \omega_r - u_r}{\max(|u_r|,\varepsilon_v)}.
-$$
-
-### 5.5 Normal loads
-
-Static only in the current version:
-
-$$
-F_{zf} = F_{zf,0},\qquad F_{zr} = F_{zr,0}.
-$$
-
-There is a placeholder for later longitudinal weight transfer
-$\Delta F_z = m a_x h/L$.
-
-### 5.6 Tyre force evaluation
-
-$$
-(F_{xf},F_{yf}) = \texttt{tire\_forces}(F_{zf},\alpha_f,\kappa_f,p,\text{`front'}),\quad
-(F_{xr},F_{yr}) = \texttt{tire\_forces}(F_{zr},\alpha_r,\kappa_r,p,\text{`rear'}).
-$$
-
-### 5.7 Front forces rotated into body frame
-
-Because $F_{xf},F_{yf}$ are expressed in the wheel frame at steer angle $\delta$,
-they are rotated:
-
-$$
-F_{xf}^{\text{body}} = F_{xf}\cos\delta - F_{yf}\sin\delta,\qquad
-F_{yf}^{\text{body}} = F_{yf}\cos\delta + F_{xf}\sin\delta.
-$$
-
-The rear axle is not steered so $F_{xr}^{\text{body}}=F_{xr}$,
-$F_{yr}^{\text{body}}=F_{yr}$.
-
-### 5.8 Rigid‑body equations of motion
-
-In the rotating body frame (so $\mathbf v$ has Coriolis‑style cross terms):
-
-$$
-\dot u = \frac{F_{xf}^{\text{body}} + F_{xr}^{\text{body}}}{m} + v r,
-\qquad
-\dot v = \frac{F_{yf}^{\text{body}} + F_{yr}^{\text{body}}}{m} - u r,
-$$
-
-$$
-\dot r = \frac{a\,F_{yf}^{\text{body}} - b\,F_{yr}^{\text{body}}}{I_z}.
-$$
-
-### 5.9 Wheel spin dynamics
-
-For each wheel a torque balance about the spin axis:
-
-$$
-\dot\omega_f = \frac{T_f - R_w F_{xf}}{J_w},\qquad
-\dot\omega_r = \frac{T_r - R_w F_{xr}}{J_w}.
-$$
-
-Positive $T_\cdot$ accelerates the wheel; the tyre's longitudinal reaction
-provides braking torque on the wheel through $R_w F_x$.
-
-### 5.10 Global pose kinematics
-
-$$
-\dot X = u\cos\psi - v\sin\psi,\quad
-\dot Y = u\sin\psi + v\cos\psi,\quad
-\dot\psi = r.
-$$
-
-The packed derivative $\dot{\mathbf x}$ is what `ode45` consumes inside
-`simulate_straight.m` and `simulate_corner.m`.
-
----
-
-## 6. GGV envelope (`ggv_envelope.m`) — current implementation
-
-This block is the **largest divergence from a "proper" QSS sim** and is the
-subject of the gap analysis. The current code does **not** solve a trim problem
-over the bicycle model. Instead, for each speed in a grid
-$v\in[0,40]\ \mathrm{m/s}$ (250 points by default), it computes:
-
-**(a) Speed‑dependent aero terms.**
-
-$$
-F_{z,\text{aero}}(v) = \tfrac12\rho\,C_l A\,v^2,\qquad
-F_{d,\text{aero}}(v) = \tfrac12\rho\,C_d A\,v^2.
-$$
-
-With the default parameters both are zero, but they are kept symbolic.
-
-**(b) Axle loads with aero downforce split 50/50.**
-
-$$
-F_{zf}(v) = F_{zf,0} + \tfrac12 F_{z,\text{aero}}(v),\qquad
-F_{zr}(v) = F_{zr,0} + \tfrac12 F_{z,\text{aero}}(v).
-$$
-
-**(c) Force capacities — friction circle / box, not optimiser.**
-
-$$
-\begin{aligned}
-F_{x,\text{drive}}^{\max}(v) &= \max\!\big(\mu_{xf}F_{zf} + \mu_{xr}F_{zr} - F_{d,\text{aero}},\,0\big),\\[2pt]
-F_{x,\text{brake}}^{\max}(v) &= \max\!\big(\mu_{xf}F_{zf} + \mu_{xr}F_{zr} + F_{d,\text{aero}},\,0\big),\\[2pt]
-F_{y}^{\max}(v) &= \max\!\big(\mu_{yf}F_{zf} + \mu_{yr}F_{zr},\,0\big).
-\end{aligned}
-$$
-
-The signs in the longitudinal capacities follow from drag opposing motion: drag
-**subtracts** from net drive force but **assists** braking.
-
-**(d) Accelerations.** Divide by mass:
-
-$$
-a_x^+(v) = \frac{F_{x,\text{drive}}^{\max}(v)}{m},\quad
-a_x^-(v) = \frac{F_{x,\text{brake}}^{\max}(v)}{m},\quad
-a_y^{\max}(v) = \frac{F_y^{\max}(v)}{m}.
-$$
-
-The output struct `ggv` stores $v$, $a_x^\pm$, $a_y^{\max}$, and the underlying
-force capacities and axle loads as per‑speed diagnostics.
-
-This formulation is a **friction box scaled by static + aero‑adjusted loads**.
-It is independent of slip angles, slip ratios, the bicycle model, and the
-nonlinear tyre force law. Mike's "shortcut if you don't mind taking shortcuts"
-clause is what is being used here.
-
----
-
-## 7. Curvature speed limits (`compute_speed_limits.m`)
-
-For steady cornering at speed $v$ on a path of curvature $\kappa$, the lateral
-acceleration demand is $a_y = v^2|\kappa|$. Imposing $a_y \leq a_y^{\max}$,
-
-$$
-v_{\text{lim}}(s) = \min\!\left(\sqrt{\frac{a_y^{\text{ref}}}{|\kappa(s)|}},\; v_{\text{cap}}\right),
-\qquad |\kappa|\geq 10^{-10}.
-$$
-
-On straights ($|\kappa|<10^{-10}$) the cap is just $v_{\text{cap}}=\max(\mathtt{ggv.v})$.
-
-**Choice of $a_y^{\text{ref}}$.** The implementation uses
-
-$$
-a_y^{\text{ref}} = \min_{v\in\mathtt{ggv.v}}\;a_y^{\max}(v).
-$$
-
-This is conservative — it picks the *worst* lateral grip over the whole speed
-range. While aero is off the GGV is flat in speed, so this is harmless; once
-$C_l A > 0$ this becomes incorrect and the relation $v_{\text{lim}}^2|\kappa| = a_y^{\max}(v_{\text{lim}})$
-becomes implicit and needs a fixed‑point solve per node.
-
----
-
-## 8. Forward acceleration pass (`lap_forward_pass.m`)
-
-Starting at the first node with $v(0)=\min(v_{\text{lim}}(0),\,0.5)\ \mathrm{m/s}$,
-march along the track and apply the maximum available longitudinal
-acceleration at each step:
-
-$$
-a_{\max}(v) = \max\!\big(\mathrm{interp1}(\mathtt{ggv.v},\,a_x^+,\,v_i),\,0\big),
-$$
-
-$$
-v_{i+1}^{\text{trial}} = \sqrt{\max\!\big(v_i^2 + 2\,a_{\max}(v_i)\,\Delta s_i,\,0\big)},
-$$
-
-$$
-v_{i+1} = \min\!\big(v_{i+1}^{\text{trial}},\,v_{\text{lim}}(i+1)\big).
-$$
-
-The first equation interpolates the GGV's positive‑$x$ envelope at the current
-speed. The second is the standard "constant acceleration over a spatial step"
-kinematic relation, equivalent to applying $v\,\mathrm{d}v = a_x\,\mathrm{d}s$.
-The third clips to the curvature limit at the next node.
-
-Cumulative segment time uses the mean speed of the segment:
-
-$$
-t_{i+1} = t_i + \frac{\Delta s_i}{\max\!\big(\tfrac12(v_i+v_{i+1}),\,10^{-3}\big)}.
-$$
-
----
-
-## 9. Backward braking pass (`lap_backward_pass.m`)
-
-Identical structure but marched from the end of the track backwards. The
-braking acceleration is interpolated from $a_x^-$ and is treated as a positive
-magnitude in the kinematic update:
-
-$$
-a_{\text{brake}}(v) = \max\!\big(\mathrm{interp1}(\mathtt{ggv.v},\,a_x^-,\,v_i),\,0\big),
-$$
-
-$$
-v_{i-1} = \min\!\Big(\sqrt{v_i^2 + 2\,a_{\text{brake}}(v_i)\,\Delta s_{i-1}},\;v_{\text{lim}}(i-1)\Big).
-$$
-
-The sign on $a_x$ reported as $-a_{\text{brake}}$ is stored so the merged
-profile reads with the convention "positive acceleration, negative deceleration".
-
-**Initialisation.** Currently $v_N = \min(v_{\text{lim}}(N),\, 0.5\,\max v_{\text{lim}})$.
-This is heuristic — a proper closed‑track sim should iterate so
-$v_0 \approx v_N$.
-
----
-
-## 10. Merge and active bound (`lap_merge.m`)
-
-The forward pass enforces acceleration feasibility, the backward pass enforces
-braking feasibility, so the feasible speed is the pointwise minimum:
-
-$$
-v(s_i) = \min\!\big(v^{\text{fwd}}(s_i),\;v^{\text{bwd}}(s_i)\big).
-$$
-
-For diagnostics the code tags each node by which bound is active:
-
-```
-source(i) = "forward"   if v_fwd(i) < v_bwd(i)
-source(i) = "backward"  if v_bwd(i) < v_fwd(i)
-source(i) = "both"      if equal (typically apex of a corner)
-```
-
-A finite‑difference longitudinal acceleration is recovered from $v(s)$ via the
-energy relation $\mathrm{d}(v^2)/\mathrm{d}s = 2 a_x$:
-
-$$
-a_x(s_i) \approx \frac{v_{i+1}^2 - v_i^2}{2\,\Delta s_i}.
-$$
-
-Cumulative time is recomputed on the merged profile by the same trapezoidal
-rule as in the forward/backward passes.
-
----
-
-## 11. Lap time (`compute_lap_time.m`)
-
-$$
-T_{\text{lap}} = \sum_{i=1}^{N-1}\frac{\Delta s_i}{\max\!\big(\tfrac12(v_i+v_{i+1}),\,10^{-3}\big)}.
-$$
-
-This is the trapezoidal approximation of $T = \int_0^L \mathrm{d}s/v(s)$. The
-$10^{-3}$ floor prevents the integrand from blowing up at zero speed (which can
-happen at the very first node).
-
----
-
-## 12. Vehicle‑model unit tests
-
-### 12.1 `simulate_straight.m`
-
-Initial state $\mathbf x_0 = (0.5,\,0,\,0,\,0.5/R_w,\,0.5/R_w,\,0,\,0,\,0)$,
-constant input $(\delta,T_f,T_r) = (0,\,0,\,120)\ \mathrm{N\,m}$ rear drive,
-integrated with `ode45` over $t\in[0,8]\ \mathrm{s}$ at tolerances
-$\text{RelTol}=10^{-8}$, $\text{AbsTol}=10^{-10}$. Reports final $u$, $v$, $r$,
-$Y$ and plots $u(t)$, $|\mathbf V|(t)$, $v(t)$, $r(t)$, $(X,Y)$. Pass criteria:
-$v\to 0$, $r\to 0$, $Y\to 0$, $u$ grows monotonically.
-
-### 12.2 `simulate_corner.m`
-
-Same model, but $u_0 = 5\ \mathrm{m/s}$ and a constant steer
-$\delta = 25^\circ$ with $T_r = 80\ \mathrm{N\,m}$. Pass criteria: $r\neq 0$,
-$v\neq 0$, curved path in $(X,Y)$. These are not lap‑time tests — they confirm
-sign conventions and stability of `bicycle_rhs.m` in isolation.
-
----
-
-## 13. Solver conventions, numerical guards, and units
-
-* Arc length $s$ in metres, time in seconds, velocity in m/s, accelerations in
-  m/s², angles in radians, forces in newtons, torques in N·m. Steer angle limit
-  is stored in radians after `deg2rad` conversion.
-* Velocity guard $\varepsilon_v = 10^{-3}\ \mathrm{m/s}$ in slip calculations
-  prevents division by zero at standstill.
-* Force guard $\varepsilon = 10^{-9}$ in the tyre saturation argument avoids
-  $0/0$ when $F_z\to 0$.
-* Speed floor $10^{-3}\ \mathrm{m/s}$ in all $\Delta s / v_{\text{avg}}$
-  integrations prevents lap time from diverging at the first node.
-* All squared‑speed updates use $\max(\cdot,0)$ before $\sqrt{\cdot}$ to keep
-  the solver robust against tiny negative round‑off when $v_i\to 0$.
-* Angle unwrapping is applied to $\psi$ from `atan2` so curvature
-  $\kappa = \mathrm{d}\psi/\mathrm{d}s$ is well‑defined across $\pm\pi$ crossings.
-
-
-## 14. Symbols quick reference
-
-| Symbol | Meaning | Units |
+| Input | Symbol | Description |
 |---|---|---|
-| $s$ | arc length | m |
-| $\kappa$ | path curvature | 1/m |
-| $\psi$ | heading angle | rad |
-| $v$ | speed along path | m/s |
-| $u,v$ | body‑frame long/lat velocity | m/s |
-| $r$ | yaw rate | rad/s |
-| $\omega_f,\omega_r$ | wheel spin | rad/s |
-| $\delta$ | steer angle | rad |
-| $\alpha$ | slip angle | rad |
-| $\kappa_{\text{tyre}}$ | longitudinal slip ratio | – |
-| $F_z, F_x, F_y$ | tyre normal / long / lat force | N |
-| $T_f, T_r$ | wheel torques | N·m |
-| $a, b$ | CG to front / rear axle | m |
-| $L$ | wheelbase | m |
-| $m, I_z$ | mass / yaw inertia | kg, kg·m² |
-| $R_w, J_w$ | wheel radius / spin inertia | m, kg·m² |
-| $\mu_x, \mu_y$ | peak friction long / lat | – |
-| $C_x, C_\alpha$ | linear long / lat tyre stiffness | N, N/rad |
-| $\rho, C_dA, C_lA$ | air density, drag / lift area | kg/m³, m² |
-| $g$ | gravity | m/s² |
+| Slip angle | α | Angle between wheel heading and velocity vector at contact patch [rad] |
+| Slip ratio | κ | (ω·R_e − v_x) / v_x — normalised difference between wheel speed and hub speed |
+| Vertical load | F_z | Normal force at contact patch [N], computed from weight + load transfer + aero |
+
+### Linear Tire Model
+
+Valid only near zero slip. Cornering stiffness C_α and longitudinal stiffness C_κ are constants independent of load. Simplest possible model — useful for analytical solutions and initial bicycle model work.
+
+**LATERAL FORCE**
+
+$$
+F_y = -C_\alpha \cdot \alpha
+$$
+
+**LONGITUDINAL FORCE**
+
+$$
+F_x = -C_\kappa \cdot \kappa
+$$
+
+**SELF-ALIGNING MOMENT — LINEAR APPROXIMATION**
+
+$$
+M_z = t_p \cdot C_\alpha \cdot \alpha
+$$
+
+where t_p is pneumatic trail [m], typically 0.01–0.05 m. Often neglected in linear models.
+
+| Parameter | Unit | Typical value |
+|---|---|---|
+| C_α | N/rad | 50,000–100,000 per tire |
+| C_κ | N/– | 80,000–150,000 per tire |
+| t_p | m | 0.01–0.05 |
+
+### Nonlinear Saturating Tire Model
+
+Retains linear stiffness near zero slip but saturates at the friction limit μ·F_z. The tanh function provides a smooth transition. Load dependence is included by scaling stiffness with F_z.
+
+**LATERAL FORCE**
+
+$$
+F_y = -\mu_y F_z \tanh\!\left(\frac{C_{\alpha 0}}{\mu_y F_{z0}} \cdot \frac{F_z}{F_{z0}} \cdot \alpha\right)
+$$
+
+**LONGITUDINAL FORCE**
+
+$$
+F_x = -\mu_x F_z \tanh\!\left(\frac{C_{\kappa 0}}{\mu_x F_{z0}} \cdot \frac{F_z}{F_{z0}} \cdot \kappa\right)
+$$
+
+**COMBINED SLIP — FRICTION ELLIPSE SCALING**
+
+$$
+F_x^{comb} = F_x \cdot \frac{1}{\sqrt{1 + (F_y / \mu_y F_z)^2}}, \qquad F_y^{comb} = F_y \cdot \frac{1}{\sqrt{1 + (F_x / \mu_x F_z)^2}}
+$$
+
+| Parameter | Unit | Description |
+|---|---|---|
+| μ_x, μ_y | — | Peak friction coefficients longitudinal and lateral |
+| C_α0, C_κ0 | N/rad, N/— | Stiffness at reference load F_z0 |
+| F_z0 | N | Reference normal load (nominal static load per tire) |
+
+### Pacejka Magic Formula
+
+Empirical curve fit covering the full slip range including peak and falloff. Parameters B, C, D, E are fitted to measured tire data. D is the peak force and is load-dependent.
+
+**CORE MAGIC FORMULA — BOTH AXES USE THIS FORM**
+
+$$
+F = D \sin\!\left[C \arctan\!\left(Bx - E\left(Bx - \arctan Bx\right)\right)\right]
+$$
+
+$$
+\text{where } x = \alpha \text{ (lateral) or } x = \kappa \text{ (longitudinal)}
+$$
+
+**LATERAL FORCE — PURE SLIP**
+
+$$
+F_y(\alpha, F_z) = D_y \sin\!\left[C_y \arctan\!\left(B_y\alpha - E_y(B_y\alpha - \arctan B_y\alpha)\right)\right]
+$$
+
+$$
+D_y = \mu_y F_z, \qquad B_y = \frac{C_{\alpha}}{C_y D_y}
+$$
+
+**LONGITUDINAL FORCE — PURE SLIP**
+
+$$
+F_x(\kappa, F_z) = D_x \sin\!\left[C_x \arctan\!\left(B_x\kappa - E_x(B_x\kappa - \arctan B_x\kappa)\right)\right]
+$$
+
+$$
+D_x = \mu_x F_z, \qquad B_x = \frac{C_{\kappa}}{C_x D_x}
+$$
+
+**SELF-ALIGNING MOMENT — OWN MAGIC FORMULA FIT**
+
+$$
+M_z(\alpha, F_z) = D_{Mz} \sin\!\left[C_{Mz} \arctan\!\left(B_{Mz}\alpha - E_{Mz}(B_{Mz}\alpha - \arctan B_{Mz}\alpha)\right)\right]
+$$
+
+$$
+D_{Mz} = -t_0 \cdot C_\alpha \qquad \text{(t}_0\text{ = pneumatic trail at zero slip)}
+$$
+
+**COMBINED SLIP — FRICTION ELLIPSE ON PACEJKA**
+
+$$
+\sigma = \sqrt{\left(\frac{\kappa}{1+\kappa}\right)^2 + \left(\frac{\tan\alpha}{1+\kappa}\right)^2}
+$$
+
+$$
+F_x^{comb} = \frac{\kappa/(1+\kappa)}{\sigma} F_x^{pure}(\sigma), \qquad F_y^{comb} = \frac{\tan\alpha/(1+\kappa)}{\sigma} F_y^{pure}(\sigma)
+$$
+
+| Parameter | Role |
+|---|---|
+| B | Stiffness factor — controls initial slope |
+| C | Shape factor — controls peak width |
+| D | Peak value = μ·F_z |
+| E | Curvature factor — controls falloff after peak |
+
+### Tire Model Compatibility
+
+| Tire model | Point mass | Bicycle | Four wheel | Solver needed |
+|---|---|---|---|---|
+| Linear | ✗ | ✓ | ✓ | Analytic / fixed point |
+| Nonlinear | circle | ✓ | ✓ | fsolve |
+| Pacejka | circle | ✓ | ✓ | fsolve / NLP |
+
+## Vehicle Models
+
+**STEP 2 — STATES + DRIVER INPUTS → ACCELERATIONS**
+
+### Point Mass
+
+No geometry, no rotation, no tire slip angles. The vehicle is a particle of mass m subject to a net friction force. The friction limit defines the GG envelope directly.
+
+**EQUATIONS OF MOTION**
+
+$$
+m\,a_x = F_x, \qquad m\,a_y = F_y
+$$
+
+$$
+\text{No yaw equation — no rotational DOF}
+$$
+
+**FRICTION CIRCLE CONSTRAINT**
+
+$$
+a_x^2 + a_y^2 \leq (\mu g)^2
+$$
+
+$$
+\text{With aero: } \quad a_x^2 + a_y^2 \leq \left(\mu\,g + \frac{\mu\,\rho\,C_L\,A_{ref}\,v^2}{2m}\right)^2
+$$
+
+States: speed v. Driver inputs: direction of net force vector. No steer angle, no sideslip, no yaw rate.
+
+### Quarter Car
+
+One corner of the vehicle. Two masses, two springs, vertical motion only. Cannot generate lateral or longitudinal forces — it lives upstream of the GGV pipeline, not inside it. Use it to compute how F_z varies dynamically under road inputs, then feed that varying F_z into the tire model.
+
+**SPRUNG MASS**
+
+$$
+m_s\,\ddot{z}_s = -k_s(z_s - z_u) - c_s(\dot{z}_s - \dot{z}_u)
+$$
+
+**UNSPRUNG MASS**
+
+$$
+m_u\,\ddot{z}_u = k_s(z_s - z_u) + c_s(\dot{z}_s - \dot{z}_u) - k_t(z_u - z_r)
+$$
+
+**DYNAMIC NORMAL LOAD (feeds into tire model)**
+
+$$
+F_z(t) = k_t\,(z_u(t) - z_r(t))
+$$
+
+> Quarter car position in pipeline: road profile → quarter car ODE → F_z(t) → tire model → GGV. It is an upstream pre-processor, not part of the trim optimiser loop.
+
+### Bicycle Model (Half Car)
+
+Two wheels on the centreline. Front wheel steerable. Captures yaw dynamics, sideslip, understeer and oversteer. No track width — left and right wheels on each axle are collapsed to one. This is the standard model for GGV generation with a trim optimiser.
+
+#### Slip Angles
+
+**FRONT AND REAR SLIP ANGLES — EXACT FORM**
+
+$$
+\alpha_f = \delta - \arctan\!\left(\frac{v + a\,r}{u}\right)
+$$
+
+$$
+\alpha_r = -\arctan\!\left(\frac{v - b\,r}{u}\right)
+$$
+
+#### Slip Ratios
+
+**LONGITUDINAL SLIP**
+
+$$
+\kappa_f = \frac{\omega_f R_e - u}{\max(|u|, \varepsilon)}, \qquad \kappa_r = \frac{\omega_r R_e - u}{\max(|u|, \varepsilon)}
+$$
+
+#### Force Rotation into Body Frame
+
+**FRONT AXLE — ROTATE BY STEER ANGLE δ**
+
+$$
+F_{x,f}^{body} = F_{xf}\cos\delta - F_{yf}\sin\delta
+$$
+
+$$
+F_{y,f}^{body} = F_{yf}\cos\delta + F_{xf}\sin\delta
+$$
+
+#### Equations of Motion — Bicycle
+
+**LONGITUDINAL**
+
+$$
+m(\dot{u} - v\,r) = F_{xf}\cos\delta - F_{yf}\sin\delta + F_{xr}
+$$
+
+**LATERAL**
+
+$$
+m(\dot{v} + u\,r) = F_{yf}\cos\delta + F_{xf}\sin\delta + F_{yr}
+$$
+
+**YAW**
+
+$$
+I_z\,\dot{r} = a\!\left(F_{yf}\cos\delta + F_{xf}\sin\delta\right) - b\,F_{yr}
+$$
+
+> The bicycle model yaw equation has no y_i·F_xi terms because all wheels are on the centreline (y_i = 0). Self-aligning moment M_z from the tire can be added: I_z·ṙ = a(F_yf cosδ + F_xf sinδ) − b·F_yr + M_zf + M_zr
+
+### Four Wheel Model
+
+Four wheels at track width offsets ±t_f/2 (front) and ±t_r/2 (rear). Left and right loads differ due to lateral load transfer. Left and right longitudinal forces can differ (torque vectoring, differential braking). Yaw moment includes the y_i·F_xi term from each wheel's lateral position.
+
+#### Individual Wheel Yaw Contribution (from Jazar eq 10.86)
+
+**YAW MOMENT FROM WHEEL i — FULL FORM**
+
+$$
+M_{z,i} = M_{z_{w,i}} + x_i F_{y,i} - y_i F_{x,i}
+$$
+
+$$
+\text{where } x_i = \pm a \text{ or } \pm b, \quad y_i = \pm t_f/2 \text{ or } \pm t_r/2
+$$
+
+#### Four Wheel Equations of Motion
+
+**LONGITUDINAL**
+
+$$
+m\,a_x = (F_{xfl} + F_{xfr})\cos\delta - (F_{yfl} + F_{yfr})\sin\delta + F_{xrl} + F_{xrr}
+$$
+
+**LATERAL**
+
+$$
+m\,a_y = (F_{yfl} + F_{yfr})\cos\delta + (F_{xfl} + F_{xfr})\sin\delta + F_{yrl} + F_{yrr}
+$$
+
+**YAW — FULL FOUR WHEEL WITH TRACK WIDTH**
+
+$$
+I_z\,\dot{r} = a\!\left[(F_{yfl}+F_{yfr})\cos\delta + (F_{xfl}+F_{xfr})\sin\delta\right] - b(F_{yrl}+F_{yrr})
+$$
+
+$$
++ \frac{t_f}{2}\!\left[(F_{xfl}-F_{xfr})\cos\delta - (F_{yfl}-F_{yfr})\sin\delta\right] + \frac{t_r}{2}(F_{xrl}-F_{xrr})
+$$
+
+$$
++ M_{zfl} + M_{zfr} + M_{zrl} + M_{zrr}
+$$
+
+## Load Transfer
+
+**COUPLING: ACCELERATIONS → F_z → TIRE FORCES → ACCELERATIONS**
+
+Load transfer couples the vehicle accelerations back into the tire normal loads, which changes the tire force limits. This is an implicit loop — the system must be solved simultaneously.
+
+**STATIC AXLE LOADS**
+
+$$
+F_{z,f}^{static} = \frac{mgb}{L}, \qquad F_{z,r}^{static} = \frac{mga}{L}
+$$
+
+**LONGITUDINAL LOAD TRANSFER — REARWARD UNDER ACCELERATION**
+
+$$
+\Delta F_z^{long} = \frac{m\,a_x\,h_{cg}}{L}
+$$
+
+$$
+F_{z,f} \rightarrow F_{z,f}^{static} - \Delta F_z^{long}, \qquad F_{z,r} \rightarrow F_{z,r}^{static} + \Delta F_z^{long}
+$$
+
+**LATERAL LOAD TRANSFER — FOUR WHEEL REQUIRED**
+
+$$
+\Delta F_{z,f}^{lat} = \frac{m\,a_y\,h_{f}}{2t_f}, \qquad \Delta F_{z,r}^{lat} = \frac{m\,a_y\,h_{r}}{2t_r}
+$$
+
+**PER-WHEEL NORMAL LOADS**
+
+$$
+F_{z,fl} = \frac{F_{z,f} - \Delta F_z^{long}}{2} - \Delta F_{z,f}^{lat}
+$$
+
+$$
+F_{z,fr} = \frac{F_{z,f} - \Delta F_z^{long}}{2} + \Delta F_{z,f}^{lat}
+$$
+
+$$
+F_{z,rl} = \frac{F_{z,r} + \Delta F_z^{long}}{2} - \Delta F_{z,r}^{lat}
+$$
+
+$$
+F_{z,rr} = \frac{F_{z,r} + \Delta F_z^{long}}{2} + \Delta F_{z,r}^{lat}
+$$
+
+**AERODYNAMIC DOWNFORCE — SPEED DEPENDENT**
+
+$$
+F_{aero} = \frac{1}{2}\rho\,C_L\,A_{ref}\,v^2
+$$
+
+$$
+F_{z,f} \mathrel{+}= \xi_f \cdot F_{aero}, \qquad F_{z,r} \mathrel{+}= \xi_r \cdot F_{aero}
+$$
+
+$$
+\xi_f + \xi_r = 1 \quad \text{(aero balance)}
+$$
+
+**NON-NEGATIVITY CONSTRAINT — WHEEL LIFT**
+
+$$
+F_{z,ij} \geq 0 \quad \forall\, i \in \{f,r\},\; j \in \{l,r\}
+$$
+
+## Optimiser Methods
+
+**STEP 3 — WRAP AROUND VEHICLE MODEL → TRIM → MAX ACCELERATION**
+
+For quasi-static GGV generation, steady state is imposed: ṙ = 0 and β̇ = 0. The car is in trimmed equilibrium — no yaw acceleration, constant sideslip. The acceleration magnitude A in direction φ is then maximised. The direction angle φ is polar coordinates in the GG plane.
+
+**POLAR PARAMETERISATION OF THE GG PLANE**
+
+$$
+a_x = A\cos\varphi, \qquad a_y = A\sin\varphi, \qquad \varphi \in [0,2\pi)
+$$
+
+$$
+r = \frac{a_y}{v} = \frac{A\sin\varphi}{v} \quad \text{(kinematic, trim condition)}
+$$
+
+### Option 1 — Friction Circle (Point Mass Only)
+
+No vehicle model, no solver. The GG envelope is computed analytically from the friction limit and aero downforce.
+
+**GG ENVELOPE — DIRECT FORMULA**
+
+$$
+A_{max}(\varphi, v) = \mu\,g + \frac{\mu\,\rho\,C_L\,A_{ref}\,v^2}{2m}
+$$
+
+$$
+\text{The envelope is a speed-dependent circle — same in all directions } \varphi
+$$
+
+**ASYMMETRIC ELLIPSE — SEPARATE BRAKING AND DRIVE LIMITS**
+
+$$
+\left(\frac{a_x}{a_{x,lim}(\varphi)}\right)^2 + \left(\frac{a_y}{\mu_y g_{eff}}\right)^2 \leq 1
+$$
+
+$$
+a_{x,lim} = \begin{cases} \mu_x g_{eff} \cdot \eta_{drive} & a_x > 0 \\ \mu_x g_{eff} & a_x < 0 \end{cases}
+$$
+
+$$
+\text{where } \eta_{drive} < 1 \text{ for RWD/FWD, } \eta_{drive} = 1 \text{ for AWD}
+$$
+
+### Option 2 — Fixed Point Iteration (Bicycle + Linear Tire)
+
+No external solver. Exploit the fact that with a linear tire, yaw balance gives a closed-form relationship between δ and β. Iterate to convergence.
+
+**FIXED POINT ALGORITHM**
+
+1. Given (v, φ, A): set target a_x = A cosφ, a_y = A sinφ, r = a_y/v
+2. Initial guess: β = 0, δ = a_y·L/v² (Ackermann)
+3. Compute α_f = δ − β − a·r/v, α_r = −β + b·r/v
+4. Compute F_yf = −C_αf·α_f, F_yr = −C_αr·α_r
+5. Yaw residual: ΔM = a·F_yf − b·F_yr. Correct δ ← δ − ΔM/(a·C_αf)
+6. Lateral residual: Δa_y = (F_yf + F_yr)/m − a_y. Correct β ← β − Δa_y·m/(C_αf + C_αr)
+7. Repeat from step 3 until |ΔM| < ε and |Δa_y| < ε
+8. Check tire limits. If violated, reduce A and repeat.
+
+### Option 3 — Root Finding with fsolve (Bicycle + Nonlinear/Pacejka)
+
+Write the three equilibrium equations as residuals. At fixed (v, φ, A), solve for the free variables [δ, β, κ_r]. Bisect on A until a tire constraint becomes active.
+
+**RESIDUAL VECTOR — THREE EQUATIONS, THREE UNKNOWNS [δ, β, κ_r]**
+
+$$
+g_1 = m A\cos\varphi - \left[F_{xf}\cos\delta - F_{yf}\sin\delta + F_{xr}\right] = 0
+$$
+
+$$
+g_2 = m A\sin\varphi - \left[F_{yf}\cos\delta + F_{xf}\sin\delta + F_{yr}\right] = 0
+$$
+
+$$
+g_3 = a(F_{yf}\cos\delta + F_{xf}\sin\delta) - b\,F_{yr} = 0
+$$
+
+**FSOLVE + BISECTION ALGORITHM**
+
+1. Given (v, φ): set A_lo = 0, A_hi = μg_eff (initial upper bound)
+2. Bisect: A_mid = (A_lo + A_hi)/2
+3. Compute r = A_mid sinφ / v. Update F_z from load transfer using (A_mid cosφ, A_mid sinφ)
+4. Call fsolve on [g1, g2, g3] with unknowns [δ, β, κ_r], warm-started from previous solution
+5. Evaluate friction ellipse for each tire: h_i = (F_xi/μx F_zi)² + (F_yi/μy F_zi)²
+6. If max(h_i) < 1: A_lo ← A_mid (feasible, can go higher). If max(h_i) > 1: A_hi ← A_mid (infeasible)
+7. Repeat from step 2 until A_hi − A_lo < tolerance
+8. Store A* = A_lo as the GGV point at (v, φ)
+
+### Option 4 — Constrained NLP (Four Wheel + Pacejka)
+
+Maximise A directly as the objective. All driver inputs and vehicle states are free variables simultaneously. Equality constraints enforce dynamics. Inequality constraints enforce tire limits. Suitable for fmincon (MATLAB) or IPOPT.
+
+**OBJECTIVE**
+
+$$
+\max_{\mathbf{x}} \quad A
+$$
+
+$$
+\mathbf{x} = [\delta,\; \kappa_{fl},\; \kappa_{fr},\; \kappa_{rl},\; \kappa_{rr},\; \beta]
+$$
+
+**EQUALITY CONSTRAINTS — DYNAMICS (g = 0)**
+
+$$
+g_1: \quad m A\cos\varphi = F_x^{total}(\mathbf{x}, v, A)
+$$
+
+$$
+g_2: \quad m A\sin\varphi = F_y^{total}(\mathbf{x}, v, A)
+$$
+
+$$
+g_3: \quad M_z^{total}(\mathbf{x}, v, A) = 0
+$$
+
+**INEQUALITY CONSTRAINTS — TIRE FRICTION ELLIPSE (h ≤ 0)**
+
+$$
+h_i: \quad \left(\frac{F_{x,i}}{\mu_x F_{z,i}}\right)^2 + \left(\frac{F_{y,i}}{\mu_y F_{z,i}}\right)^2 - 1 \leq 0 \quad \forall\; i \in \{fl,fr,rl,rr\}
+$$
+
+**BOUND CONSTRAINTS**
+
+$$
+\delta_{min} \leq \delta \leq \delta_{max}, \quad -1 \leq \kappa_{ij} \leq \kappa_{drive,max}, \quad F_{z,i} \geq 0
+$$
+
+**KKT CONDITIONS AT OPTIMUM — ACTIVE TIRE LIMITS**
+
+$$
+\nabla_{\mathbf{x}} A = \sum_j \lambda_j \nabla_{\mathbf{x}} g_j + \sum_i \mu_i \nabla_{\mathbf{x}} h_i
+$$
+
+$$
+\mu_i \geq 0, \quad \mu_i\,h_i = 0 \quad \text{(tire not at limit → } \mu_i = 0\text{)}
+$$
+
+### Option 5 — Milliken Moment Method (MMM)
+
+Grid evaluation, no optimiser. Sweep [δ, β] over a grid. At each grid point evaluate yaw moment N and lateral force Y. The trim line is where N = 0. Read the maximum Y off this line — that is the peak lateral acceleration in the trimmed state.
+
+**MMM ALGORITHM**
+
+1. Fix speed v. Define grid: β ∈ [−β_max, β_max], δ ∈ [−δ_max, δ_max]
+2. For each (β_i, δ_j): compute α_f, α_r, then tire forces, then N = I_z·ṙ and Y = m·a_y
+3. Interpolate the N = 0 contour across the (β, δ) grid — this is the trim line
+4. Along the trim line, find max(Y) — this is a_y,max at speed v
+5. For braking/acceleration: add F_x as a parameter and repeat
+
+### Optimiser Compatibility Matrix
+
+| Method | Point mass | Bicycle | Four wheel | Linear | Nonlinear | Pacejka |
+|---|---|---|---|---|---|---|
+| Friction circle | ✓ only | ✗ | ✗ | ✗ | circle | circle |
+| Fixed point | ✗ | ✓ | ✗ | ✓ | marginal | ✗ |
+| fsolve | ✗ | ✓ | limited | ✓ | ✓ | ✓ |
+| NLP (fmincon) | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| MMM | ✗ | ✓ | ✓ | ✓ | ✓ | ✓ |
+
+## GGV Surface Generation
+
+**STEP 4 — OPTIMISER AT EVERY (v, φ) → FULL SURFACE**
+
+The GGV surface is built independently of the track. It is a lookup table of maximum achievable acceleration as a function of speed and direction. Once built it is interpolated during the lap simulation.
+
+**GGV GENERATION PROCEDURE**
+
+1. Define speed grid: v ∈ {v_1, v_2, ..., v_N} — start from low speed (e.g. 10 m/s), step up through expected operating range
+2. Define direction grid: φ_j = j · 2π/M for j = 0, 1, ..., M−1. Typically M = 36 to 72 points (5° to 10° resolution)
+3. For each v_i: update static loads, aero downforce F_aero(v_i), load distribution
+4. For each φ_j: run the chosen optimiser → returns A*_ij and the trim solution [δ*, β*, κ*]
+5. Store GG point: a_x = A*_ij cosφ_j, a_y = A*_ij sinφ_j at speed v_i
+6. After all φ sweeps at v_i: the set of (a_x, a_y) points is the GG envelope at v_i
+7. Repeat for all v_i: stack all envelopes → GGV surface as 3D array GGV(v, a_y) → a_x_max
+8. Build interpolant: given any (v, a_y), return maximum a_x and minimum a_x (braking). Use 2D interpolation (e.g. griddedInterpolant in MATLAB)
+
+> Braking and acceleration are both computed by the same optimiser sweep — φ = π gives pure braking (a_x < 0), φ = 0 gives pure acceleration (a_x > 0). No assumptions are made about either direction.
+
+## Circuit Model
+
+**STEP 5 — CURVATURE κ(s) AGAINST DISTANCE s**
+
+The circuit is represented as a 1D vector of curvature values against arc length along the racing line. The lap sim does not need X,Y coordinates — only κ(s).
+
+### Constant Radius Circle
+
+**CIRCLE**
+
+$$
+\kappa(s) = \frac{1}{R} = \text{const}, \qquad s \in [0, 2\pi R]
+$$
+
+### Piecewise Analytic (Straights and Corners)
+
+**PIECEWISE CURVATURE**
+
+$$
+\kappa(s) = \begin{cases} 0 & \text{straight segment} \\ 1/R_k & \text{corner } k \text{ with radius } R_k \end{cases}
+$$
+
+### Real Circuit from (X, Y) Coordinates
+
+Given GPS or geometric data as discrete points (X_i, Y_i), compute arc length and curvature numerically.
+
+**ARC LENGTH PARAMETERISATION**
+
+$$
+s_i = \sum_{j=1}^{i} \sqrt{(X_j - X_{j-1})^2 + (Y_j - Y_{j-1})^2}
+$$
+
+**CURVATURE FROM PARAMETRIC CURVE**
+
+$$
+\kappa(s) = \frac{X'Y'' - Y'X''}{(X'^2 + Y'^2)^{3/2}}
+$$
+
+Primes are derivatives with respect to s. Compute numerically using central differences on the discrete (X_i, Y_i) data. Smooth κ(s) before use to remove GPS noise.
+
+**SIGN CONVENTION**
+
+$$
+\kappa > 0: \text{ left turn}, \quad \kappa < 0: \text{ right turn}, \quad \kappa = 0: \text{ straight}
+$$
+
+$$
+|\kappa| \text{ used for speed limit in Pass 1 (lateral acceleration is always centripetal)}
+$$
+
+## Pass 1 — Maximum Cornering Speed
+
+**LATERAL LIMIT ONLY — NO LONGITUDINAL COUPLING**
+
+At every point s on the circuit, find the maximum speed at which the vehicle can follow the curvature κ(s), using only the lateral axis of the GGV. Longitudinal acceleration is ignored entirely — this pass does not know what came before or after on the track.
+
+**CENTRIPETAL ACCELERATION REQUIRED TO FOLLOW κ(s) AT SPEED v**
+
+$$
+a_y^{required}(s, v) = v^2 \cdot |\kappa(s)| = \frac{v^2}{R(s)}
+$$
+
+**MAXIMUM LATERAL ACCELERATION AVAILABLE FROM GGV AT SPEED v**
+
+$$
+a_{y,max}(v) = \text{GGV}(v, \varphi = 90°) \quad \text{(pure lateral, a_x = 0)}
+$$
+
+**PASS 1 — MAXIMUM SPEED AT EACH POINT s**
+
+$$
+v_{max,1}(s) : \quad v^2 |\kappa(s)| = a_{y,max}(v)
+$$
+
+$$
+\text{Solved iteratively since } a_{y,max} \text{ depends on } v
+$$
+
+$$
+\textbf{Iteration: } v^{(k+1)} = \sqrt{\frac{a_{y,max}(v^{(k)})}{|\kappa(s)|}} \quad \text{until convergence}
+$$
+
+$$
+\text{On a straight: } |\kappa| = 0 \Rightarrow v_{max,1} = \infty \text{ — no lateral constraint there}
+$$
+
+> Pass 1 gives a speed ceiling at every point independently. There is no continuity between adjacent points — the profile can jump from very high speed on a straight to the corner limit with no transition. Passes 2 and 3 enforce that continuity.
+
+## Passes 2 & 3 — Longitudinal Continuity
+
+**FORWARD ACCELERATION SWEEP + BACKWARD BRAKING SWEEP**
+
+Pass 1 gives no continuity between points — a car cannot instantly reach corner speed on a straight or instantly slow for a hairpin. Passes 2 and 3 enforce physical continuity by asking how fast the car can accelerate and brake between successive points, using the longitudinal axis of the GGV at the current lateral load.
+
+### GGV Lookup During Passes
+
+**LONGITUDINAL LIMIT FROM GGV — GIVEN CURRENT (v, a_y)**
+
+$$
+a_x^{accel}(v, a_y) = \text{GGV\_interp}(v, a_y, \text{drive side})
+$$
+
+$$
+a_x^{brake}(v, a_y) = \text{GGV\_interp}(v, a_y, \text{brake side}) \quad \text{(negative value)}
+$$
+
+$$
+\text{where } a_y = v^2 |\kappa(s)| \text{ at the current point}
+$$
+
+### Anchor Point
+
+**STARTING POINT FOR BOTH SWEEPS**
+
+$$
+s^* = \arg\min_s\; v_{max,1}(s) \quad \text{— the tightest corner (lowest Pass 1 speed)}
+$$
+
+$$
+v_{start} = v_{max,1}(s^*) \quad \text{— both passes begin here}
+$$
+
+### Pass 2 — Forward Sweep (Acceleration Out of Corners)
+
+**PASS 2 — FORWARD MARCH FROM s* AROUND THE FULL LAP**
+
+$$
+v_{fwd}(s + \Delta s) = \min\!\left(v_{max,1}(s + \Delta s),\; \sqrt{v_{fwd}(s)^2 + 2\,a_x^{accel}(v_{fwd}(s),\, v_{fwd}(s)^2|\kappa(s)|)\,\Delta s}\right)
+$$
+
+### Pass 3 — Backward Sweep (Braking Into Corners)
+
+**PASS 3 — BACKWARD MARCH FROM s* AROUND THE FULL LAP**
+
+$$
+v_{bwd}(s - \Delta s) = \min\!\left(v_{max,1}(s - \Delta s),\; \sqrt{v_{bwd}(s)^2 + 2\,|a_x^{brake}(v_{bwd}(s),\, v_{bwd}(s)^2|\kappa(s)|)|\,\Delta s}\right)
+$$
+
+### Final Speed Profile
+
+**SPEED PROFILE — ELEMENT-WISE MINIMUM**
+
+$$
+v(s) = \min\!\left(v_{fwd}(s),\; v_{bwd}(s)\right)
+$$
+
+> **WHY MINIMUM**  
+> At corner exit: forward sweep is binding — acceleration limited. At corner entry: backward sweep is binding — braking limited. At the apex: Pass 1 cornering limit is binding. The minimum selects the physically correct binding constraint at every point automatically. The car cannot exceed whichever constraint is tightest at each location.
+
+## Lap Time
+
+**LAP TIME INTEGRAL**
+
+$$
+t_{lap} = \int_0^{S_{lap}} \frac{ds}{v(s)} \approx \sum_{k=1}^{N} \frac{\Delta s}{v(s_k)}
+$$
+
+## Numerical Algorithms — Ready for MATLAB
+
+**COMPLETE WORKFLOW FOR EACH VEHICLE + TIRE + OPTIMISER COMBINATION**
+
+### Algorithm 1 — Point Mass + Friction Circle + Any Circuit
+
+Simplest pipeline. No vehicle states. No optimiser. GGV is computed analytically.
+
+**PHASE 1 — BUILD GGV (ANALYTIC)**
+
+1. Define: m, μ_x, μ_y, C_L, A_ref, ρ, η_drive (drivetrain efficiency: 1.0 AWD, 0.5–0.7 RWD/FWD)
+2. Define speed grid: v = linspace(v_min, v_max, N_v)
+3. For each v_i: g_eff = g + ρ C_L A_ref v_i²/(2m) — effective gravity including aero
+4. a_y_max(v_i) = μ_y · g_eff
+5. a_x_accel_max(v_i) = μ_x · g_eff · η_drive
+6. a_x_brake_max(v_i) = −μ_x · g_eff (all wheels braking)
+7. Store GGV as: for each (v_i, a_y): a_x_max = a_x_accel · sqrt(1 − (a_y/a_y_max)²), a_x_min = a_x_brake · sqrt(1 − (a_y/a_y_max)²)
+
+**PHASE 2 — CIRCUIT MODEL**
+
+1. Circle: kappa = 1/R · ones(1, N_s), s = linspace(0, 2πR, N_s)
+2. Real circuit: load (X,Y) coordinates. Compute s by cumulative arc length. Compute kappa numerically using central differences on X,Y. Smooth kappa with a moving average or spline.
+
+**PHASE 3 — THREE PASSES**
+
+1. Pass 1: for each s_k: solve v²|κ(s_k)| = a_y_max(v) iteratively for v. Store v_max1(k).
+2. Find anchor: [~, k_star] = min(v_max1). Set v_fwd(k_star) = v_max1(k_star), v_bwd(k_star) = v_max1(k_star).
+3. Pass 2 forward: for k = k_star+1 to k_star+N_s (wrapping modulo N_s): a_y_cur = v_fwd(k-1)²·|κ(k-1)|. Lookup a_x_accel from GGV at (v_fwd(k-1), a_y_cur). v_candidate = sqrt(v_fwd(k-1)² + 2·a_x_accel·Δs). v_fwd(k) = min(v_max1(k), v_candidate).
+4. Pass 3 backward: for k = k_star-1 down to k_star-N_s (wrapping): a_y_cur = v_bwd(k+1)²·|κ(k+1)|. Lookup |a_x_brake| from GGV. v_candidate = sqrt(v_bwd(k+1)² + 2·|a_x_brake|·Δs). v_bwd(k) = min(v_max1(k), v_candidate).
+5. Final profile: v_final(k) = min(v_fwd(k), v_bwd(k)) for all k.
+6. Lap time: t_lap = sum(Δs ./ v_final)
+
+### Algorithm 2 — Bicycle + Nonlinear Tire + fsolve + Real Circuit
+
+**PHASE 1 — BUILD GGV WITH FSOLVE + BISECTION**
+
+1. Define parameters: m, I_z, a, b, L, h_cg, μ_x, μ_y, C_α0, C_κ0, F_z0, R_e, C_L, A_ref, ρ, ξ_f, ξ_r
+2. Define grids: v = linspace(v_min, v_max, N_v), phi = linspace(0, 2π−dφ, N_phi)
+3. For each v_i: compute F_aero = 0.5·ρ·C_L·A_ref·v_i². Compute F_z0_f = m·g·b/L + ξ_f·F_aero, F_z0_r = m·g·a/L + ξ_r·F_aero (before load transfer)
+4. For each phi_j: set target direction. Compute r_target = A·sin(phi_j)/v_i (function of A)
+5. Bisect on A: A_lo = 0, A_hi = 2·μ_y·g_eff
+6. At each bisection step A_mid: update F_z with longitudinal load transfer ΔFz = m·A_mid·cos(phi_j)·h_cg/L. Call fsolve([g1;g2;g3], x0=[delta_guess; beta_guess; kappa_r_guess])
+7. Residuals g1, g2, g3: compute alpha_f, alpha_r from [delta, beta, v, r]. Compute F_yf, F_yr, F_xr from nonlinear tire model. Evaluate long/lat/yaw balance equations.
+8. Evaluate friction ellipse: h_f = (F_xf/μx Fzf)² + (F_yf/μy Fzf)², h_r = (F_xr/μx Fzr)² + (F_yr/μy Fzr)². If max(h_f, h_r) < 1: A_lo ← A_mid else A_hi ← A_mid
+9. After convergence: store GGV(i,j) = A_lo. Store a_x = A_lo·cos(phi_j), a_y = A_lo·sin(phi_j).
+10. Build 2D interpolant: GGV_ax_max = griddedInterpolant({v_grid, ay_grid}, ax_max_table). Similarly for ax_min (braking side of phi sweep).
+
+**PHASE 2 — CIRCUIT + THREE PASSES (same as Algorithm 1 Phase 2 & 3)**
+
+1. Build κ(s) from circuit data as described above
+2. Pass 1: for each s_k, solve v²|κ_k| = GGV_ay_max(v) iteratively
+3. Passes 2 & 3: identical to Algorithm 1 but GGV lookup uses griddedInterpolant instead of analytic formula
+4. Lap time: t_lap = sum(Δs ./ v_final)
+
+### Algorithm 3 — Bicycle + Pacejka + NLP (fmincon)
+
+**PHASE 1 — GGV WITH FMINCON**
+
+1. Define Pacejka parameters for front and rear: Bx, Cx, Dx=μ_x·Fz, Ex, By, Cy, Dy=μ_y·Fz, Ey, and Mz parameters B_Mz, C_Mz, D_Mz for each axle
+2. For each (v_i, phi_j): formulate fmincon problem. Objective: −A (minimise negative = maximise). Variables: x = [A; delta; beta; kappa_r] (4 variables, front undriven so kappa_f = 0)
+3. Nonlinear equality constraints ceq = [g1; g2; g3] — evaluate Pacejka forces inside constraint function at current x, v_i, phi_j
+4. Nonlinear inequality constraints c = [h_f − 1; h_r − 1] — friction ellipse per axle
+5. Bounds: lb = [0; delta_min; beta_min; −1], ub = [2·g_eff; delta_max; beta_max; kappa_max]
+6. Call fmincon with options: Algorithm = 'interior-point', SpecifyObjectiveGradient = false, SpecifyConstraintGradient = false. Warm-start x0 from previous (phi_j−1) solution.
+7. Store A* = x(1). Recover a_x = A*·cos(phi_j), a_y = A*·sin(phi_j).
+8. Build GGV interpolant as in Algorithm 2
+
+### Algorithm 4 — Four Wheel + Pacejka + NLP
+
+**PHASE 1 — GGV WITH FOUR WHEEL NLP**
+
+1. Define: m, I_z, a, b, t_f, t_r, h_cg, h_f, h_r, C_L, A_ref, ρ, ξ_f, ξ_r. Pacejka parameters per wheel (or per axle if symmetric).
+2. Variables: x = [A; delta; kappa_fl; kappa_fr; kappa_rl; kappa_rr; beta] — 7 variables
+3. Inside constraint and objective evaluation: compute r = A·sin(phi)/v. Compute alpha_fl, alpha_fr from (delta, beta, v, r, t_f). Compute alpha_rl, alpha_rr from (beta, v, r, t_r).
+4. Compute F_z for each wheel using per-wheel load transfer equations with current (A·cos(phi), A·sin(phi)) as a_x, a_y. Note: this creates implicit coupling — F_z depends on A which is being optimised. Accept this and evaluate sequentially inside each function call.
+5. Call Pacejka for each wheel: [Fx_ij, Fy_ij, Mz_ij] = tire_magic(Fz_ij, alpha_ij, kappa_ij, params)
+6. Rotate front forces: Fx_fl_body = Fx_fl·cosδ − Fy_fl·sinδ, etc.
+7. Equality constraints ceq: [m·A·cos(phi) − Fx_total; m·A·sin(phi) − Fy_total; Mz_total] = 0 where Mz_total uses full four-wheel yaw equation including t_f/2 and t_r/2 terms and self-aligning moments
+8. Inequality constraints: friction ellipse for all four wheels independently: (Fx_ij/μx Fz_ij)² + (Fy_ij/μy Fz_ij)² ≤ 1, and Fz_ij ≥ 0
+9. Run fmincon. Warm-start from previous phi solution. Repeat for all (v_i, phi_j).
+10. Build GGV interpolant. Run circuit three-pass lap sim as in Algorithm 2.
+
+> In all NLP formulations: the load transfer creates an implicit dependency where F_z depends on A (the variable being optimised). This is handled by evaluating F_z inside each constraint call using the current iterate value of A. The NLP solver handles this correctly — do not pre-compute F_z outside the solver loop.
 
 ---
 
-*Document scope: theory and mathematics of the current `LTS-MATLAB` build,
-written to sit alongside the source files in the repository. The mathematics
-in §6 is intentionally honest about the shortcut: it describes what the code
-**actually computes**, not what a full QSS‑with‑trim GGV would produce.*
+References: Jazar — Vehicle Dynamics (eqs 10.84–10.86, 10.108–10.115) · Rajamani — Vehicle Dynamics and Control Ch.2 · Pacejka — Tyre and Vehicle Dynamics Ch.4 · Brayshaw & Harrison (2005) — IMechE Proc. 
