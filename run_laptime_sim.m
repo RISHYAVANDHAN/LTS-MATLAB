@@ -11,12 +11,12 @@ function result = run_laptime_sim(xy, p, options)
     % ---- Set paths ----
     rootDir = fileparts(mfilename('fullpath'));
     addpath(fullfile(rootDir, 'config'));
-    addpath(fullfile(rootDir, 'src', 'tyres'));
+    addpath(fullfile(rootDir, 'src', 'tires'));
     addpath(fullfile(rootDir, 'src', 'vehicle'));
-    addpath(fullfile(rootDir, 'src', 'optimisers'));
-    addpath(fullfile(rootDir, 'src', 'ggv'));
+    addpath(fullfile(rootDir, 'src', 'optimiser'));
+    addpath(fullfile(rootDir, 'src', 'GGV'));
     addpath(fullfile(rootDir, 'src', 'track'));
-    addpath(fullfile(rootDir, 'src', 'lap_time'));
+    addpath(fullfile(rootDir, 'src', 'laptime_calc'));
 
     % ---- Defaults ----
     if nargin < 1 || isempty(xy)
