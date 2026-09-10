@@ -15,7 +15,7 @@ function sol = lap_backward_pass(track, v_lim, ggv, p)
         if isnan(a_brake) || a_brake >= 0
             a_brake = -0.5 * p.environment.g;
         end
-        v_prev = sqrt(max(v_i^2 + 2 * a_brake * ds(i-1), 0));
+        v_prev = sqrt(max(v_i^2 - 2 * a_brake * ds(i-1), 0));
         v(i-1) = min(v_prev, v_lim(i-1));
         ax(i-1) = a_brake;
         v_avg = max(0.5*(v(i-1) + v_i), 1e-3);

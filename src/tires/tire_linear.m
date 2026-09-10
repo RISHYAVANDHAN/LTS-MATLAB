@@ -1,4 +1,4 @@
-function [Fx, Fy, Mz] = tire_linear(Fz, alpha, kappa, p, axle)
+function [Fx, Fy, Mz] = tire_linear(~, alpha, kappa, p, axle)
 %TIRE_LINEAR  Linear tyre model (HTML #t1).
 %   Fy = -C_alpha * alpha,  Fx = -C_kappa * kappa,  Mz = t_p * C_alpha * alpha.
 

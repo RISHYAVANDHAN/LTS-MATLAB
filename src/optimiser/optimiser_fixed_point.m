@@ -32,7 +32,7 @@ function [A_max, trim] = optimiser_fixed_point(v, phi, p)
             delta = delta_new; beta = beta_new;
         end
 
-        [Fzf, Fzr] = compute_normal_loads(ax, ay, v, p);
+        [Fzf, Fzr] = loads(ax, ay, v, p);
         Fy_f_lim = p.tyre.front.mu_y * Fzf;
         Fy_r_lim = p.tyre.rear.mu_y * Fzr;
         if abs(Fy_f) <= Fy_f_lim && abs(Fy_r) <= Fy_r_lim
