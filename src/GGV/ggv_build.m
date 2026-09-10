@@ -1,5 +1,5 @@
 function ggv = ggv_build(p)
-%GGV_BUILD  Build GGV surface over speed and direction (HTML #ggv).
+%GGV_BUILD  Build GGV surface over speed and direction.
 
     v_grid = linspace(5, 40, 50);
     phi_grid = linspace(0, 2*pi, 72);
@@ -23,7 +23,6 @@ function ggv = ggv_build(p)
     ax_table = A_table .* cos(phi_grid);
     ay_table = A_table .* sin(phi_grid);
 
-    % Build scattered interpolants for ax_max and ax_min
     ax_pos = []; ay_pos = []; v_pos = [];
     ax_neg = []; ay_neg = []; v_neg = [];
     for i = 1:nV
@@ -42,8 +41,9 @@ function ggv = ggv_build(p)
         end
     end
 
-    F_pos = scatteredInterpolant(v_pos, ay_pos, ax_pos, 'linear', 'none');
-    F_neg = scatteredInterpolant(v_neg, ay_neg, ax_neg, 'linear', 'none');
+    % CHANGE: extrapolate linearly instead of returning NaN
+    F_pos = scatteredInterpolant(v_pos, ay_pos, ax_pos, 'linear', 'linear');
+    F_neg = scatteredInterpolant(v_neg, ay_neg, ax_neg, 'linear', 'linear');
 
     ggv.v_grid = v_grid;
     ggv.phi_grid = phi_grid;
